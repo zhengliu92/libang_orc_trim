@@ -3241,7 +3241,16 @@
         "kind": 2,
         "importPath": "dino_base",
         "description": "dino_base",
-        "peekOfCode": "def main():\n    pipeline = GroundingDINOBase()\n    for file, image in image_loader(\"images\"):\n        detections = pipeline.process_image(image)\n        output_file = pipeline.save_image(image, file.stem, detections)\n        print(f\"Processed image saved to: {output_file}\")\nif __name__ == \"__main__\":\n    main()",
+        "peekOfCode": "def main():\n    pipeline = GroundingDINOBase()\n    for file, image in image_loader(\"images\"):\n        pipeline.process_image(image)\n        pipeline.crop_save_image(image, file.stem)\n        output_file = pipeline.save_image(image, file.stem)\n        print(f\"Processed image saved to: {output_file}\")\nif __name__ == \"__main__\":\n    main()",
+        "detail": "dino_base",
+        "documentation": {}
+    },
+    {
+        "label": "logger",
+        "kind": 5,
+        "importPath": "dino_base",
+        "description": "dino_base",
+        "peekOfCode": "logger = logging.getLogger(__name__)\nclass GroundingDINOBase:\n    def __init__(\n        self,\n        model_path: str = \"model/GroundingDINOBase\",\n        default_prompt: str = \"screen\",\n        output_dir: str = \"output\",\n        box_threshold: float = 0.1,\n        text_threshold: float = 0.3,\n        min_box_area_ratio: int = 0.05,",
         "detail": "dino_base",
         "documentation": {}
     },

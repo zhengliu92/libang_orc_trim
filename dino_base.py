@@ -7,6 +7,10 @@ import torch
 from PIL import Image
 from modelscope import AutoModelForZeroShotObjectDetection, AutoProcessor
 import pandas as pd
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class GroundingDINOBase:
@@ -23,11 +27,13 @@ class GroundingDINOBase:
         self.model_path = model_path
         self.default_prompt = default_prompt
         self.output_dir = output_dir
-        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.output_dir, "crop").mkdir(parents=True, exist_ok=True)
+        Path(self.output_dir, "detection").mkdir(parents=True, exist_ok=True)
         self.box_threshold = box_threshold
         self.text_threshold = text_threshold
         self.min_box_area_ratio = min_box_area_ratio
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.detection: dict | None = None
 
         self._processor: AutoProcessor | None = None
         self._model: AutoModelForZeroShotObjectDetection | None = None
@@ -45,6 +51,7 @@ class GroundingDINOBase:
         detections,
         image_pixel_size: int,
     ) -> typing.Dict[str, typing.Any] | None:
+        self.detection = None
         rows: typing.List[typing.Dict[str, typing.Any]] = []
         for result in detections:
             boxes = result["boxes"].cpu().numpy().astype(int)
@@ -66,21 +73,24 @@ class GroundingDINOBase:
                         "box_area_ratio": box_area_ratio,
                     }
                 )
-        if not rows:
-            return
+        if len(rows) == 0:
+            return None
         ok_data = pd.DataFrame(rows)
         if ok_data.shape[0] > 1:
             ok_data = ok_data.sort_values(by=["score"], ascending=False).reset_index(
                 drop=True
             )
-            return ok_data.iloc[0].to_dict()
-        return ok_data.iloc[0].to_dict()
+            self.detection = ok_data.iloc[0].to_dict()
+            return self.detection
+        self.detection = ok_data.iloc[0].to_dict()
+        return self.detection
 
     def process_image(
         self,
         image: Image.Image,
         text_prompt: str | None = None,
     ):
+
         processor, model = self.load_model()
         prompt = (text_prompt or self.default_prompt).strip().lower()
         if prompt and not prompt.endswith("."):
@@ -91,25 +101,50 @@ class GroundingDINOBase:
         with torch.no_grad():
             outputs = model(**inputs)
         target_sizes = [image.size[::-1]]
-        return processor.post_process_grounded_object_detection(
+        detections = processor.post_process_grounded_object_detection(
             outputs=outputs,
             input_ids=inputs.input_ids,
             threshold=self.box_threshold,
             text_threshold=self.text_threshold,
             target_sizes=target_sizes,
         )
+        image_size = image.width * image.height
+        self.filter_detections(detections, image_size)
+        return
+
+    def crop_save_image(
+        self,
+        image: Image.Image,
+        save_file_name: str,
+    ):
+        if not self.detection:
+            logger.warning(
+                f"{save_file_name}: No valid detection available for cropping."
+            )
+            return
+        output_file = Path(self.output_dir) / "crop" / f"{save_file_name}_crop.png"
+        x0, y0, x1, y1 = map(int, self.detection["box"])
+        x0 = max(0, min(x0, image.width))
+        y0 = max(0, min(y0, image.height))
+        x1 = max(x0 + 1, min(x1, image.width))
+        y1 = max(y0 + 1, min(y1, image.height))
+        cropped = image.crop((x0, y0, x1, y1))
+        cropped.save(output_file, format="PNG")
+        return str(output_file)
 
     def save_image(
         self,
         image: Image.Image,
         save_file_name: str,
-        detections,
     ):
-        output_file = Path(self.output_dir) / f"{save_file_name}_detections.png"
+        output_file = (
+            Path(self.output_dir) / "detection" / f"{save_file_name}_detection.png"
+        )
         image_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        image_pixel_size = image_bgr.shape[0] * image_bgr.shape[1]
-        detection_dict = self.filter_detections(detections, image_pixel_size)
-        if detection_dict is None:
+        if not self.detection:
+            failed_output = output_file.with_name(
+                f"{output_file.stem}_failed{output_file.suffix}"
+            )
             cv2.putText(
                 image_bgr,
                 "No valid detection",
@@ -123,12 +158,12 @@ class GroundingDINOBase:
             success, encoded_image = cv2.imencode(".png", image_bgr)
             if not success:
                 raise RuntimeError("Failed to encode image for saving.")
-            encoded_image.tofile(str(output_file))
-            return str(output_file)
+            encoded_image.tofile(str(failed_output))
+            return str(failed_output)
 
-        box = detection_dict["box"]
-        score = detection_dict["score"]
-        label = detection_dict["label"]
+        box = self.detection["box"]
+        score = self.detection["score"]
+        label = self.detection["label"]
         x0, y0, x1, y1 = map(int, box)
         cv2.rectangle(image_bgr, (x0, y0), (x1, y1), (0, 0, 255), 2)
         text = f"{label}: {score:.2f}"
@@ -195,8 +230,9 @@ def image_loader(
 def main():
     pipeline = GroundingDINOBase()
     for file, image in image_loader("images"):
-        detections = pipeline.process_image(image)
-        output_file = pipeline.save_image(image, file.stem, detections)
+        pipeline.process_image(image)
+        pipeline.crop_save_image(image, file.stem)
+        output_file = pipeline.save_image(image, file.stem)
         print(f"Processed image saved to: {output_file}")
 
 
