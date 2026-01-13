@@ -80,6 +80,90 @@ def parse_ocr_response(response_text: str) -> dict:
 
 
 @with_logging
+def check_confidence(
+    image: Image.Image,
+    model: str,
+    base_url: str = DEFAULT_BASE_URL,
+    max_tokens: int = 256,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> Optional[float]:
+    """
+    Evaluate the confidence score for data extraction from an image.
+
+    Args:
+        image: PIL Image to evaluate.
+        model: Model name to use for confidence evaluation.
+        base_url: Base URL for the OpenAI-compatible API.
+        max_tokens: Maximum tokens in response (default: 256 for score).
+        timeout: Request timeout in seconds.
+
+    Returns:
+        Confidence score as float between 0 and 1, or None if evaluation fails.
+    """
+    try:
+        image_base64 = encode_image_to_base64(image)
+    except Exception as e:
+        logger.error(f"Failed to encode image to base64 for confidence check: {e}")
+        return None
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT["score"]},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_base64}"},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "top_k": 1,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+    }
+
+    try:
+        with httpx.Client(trust_env=False, timeout=timeout) as client:
+            response = client.post(
+                f"{base_url}/chat/completions",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+
+        result = response.json()
+        result_text = result["choices"][0]["message"]["content"].strip()
+
+        # Parse confidence score from response
+        confidence = float(result_text)
+
+        # Validate score is in range [0, 1]
+        if not 0.0 <= confidence <= 1.0:
+            logger.warning(f"Confidence score {confidence} out of range [0, 1]")
+            return None
+
+        return confidence
+
+    except httpx.HTTPError as e:
+        logger.error(f"HTTP error during confidence check: {e}")
+        return None
+    except (KeyError, IndexError) as e:
+        logger.error(f"Unexpected API response format during confidence check: {e}")
+        return None
+    except ValueError as e:
+        logger.error(f"Failed to parse confidence score as float: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error during confidence check: {e}")
+        return None
+
+
+@with_logging
 def ocr_image(
     image: Image.Image,
     prompt: str,
@@ -363,20 +447,22 @@ def process_detected_image(
     device_prompt: str,
     model: str,
     crop_margin: float = DEFAULT_CROP_MARGIN,
+    confidence_threshold: float = 0.3,
 ) -> Optional[dict]:
     """
-    Process a detected image: crop, save, and perform OCR.
+    Process a detected image: crop, save, check confidence, and perform OCR.
 
     Args:
         pipeline: GroundingDINOBase instance for image processing.
         image: Original PIL Image.
         file_identifier: Unique identifier for the file.
         device_prompt: Prompt for OCR specific to the device type.
+        model: Model name to use for OCR.
         crop_margin: Margin for cropping (default: 0.10).
-        model: Model name to use for OCR (default: DEFAULT_MODEL).
+        confidence_threshold: Minimum confidence score to proceed with OCR (default: 0.3).
 
     Returns:
-        Dictionary containing OCR results, or None if processing fails.
+        Dictionary containing OCR results and confidence score, or None if processing fails.
     """
     # Crop the image
     cropped = pipeline.crop_image(image, crop_margin)
@@ -389,7 +475,22 @@ def process_detected_image(
         pipeline.save_image(cropped, file_identifier)
     except Exception as e:
         logger.error(f"Failed to save cropped image: {e}")
-        # Continue with OCR even if save fails
+        # Continue with confidence check even if save fails
+
+    # Check confidence before OCR
+    logger.info(f"Checking confidence for: {file_identifier} with model: {model}")
+    confidence = check_confidence(cropped, model=model)
+
+    if confidence is None:
+        logger.warning(f"Failed to get confidence score for {file_identifier}")
+        # Continue with OCR anyway if confidence check fails
+    elif confidence < confidence_threshold:
+        logger.warning(
+            f"Low confidence score ({confidence:.2f}) for {file_identifier}, "
+            f"below threshold {confidence_threshold}. Proceeding with OCR anyway."
+        )
+    else:
+        logger.info(f"Confidence score: {confidence:.2f} for {file_identifier}")
 
     # Perform OCR
     logger.info(f"Running OCR on cropped image: {file_identifier} with model: {model}")
@@ -404,6 +505,9 @@ def process_detected_image(
     if not flattened_result:
         logger.warning("Failed to flatten OCR result")
         return None
+
+    # Add confidence score to result
+    flattened_result["confidence"] = confidence
 
     return flattened_result
 
@@ -437,7 +541,7 @@ def handle_image(
             append_to_csv(result_data, OUTPUT_CSV)
             return
 
-        # Process detected image (crop + OCR)
+        # Process detected image (crop + confidence check + OCR)
         ocr_data = process_detected_image(
             pipeline=pipeline,
             image=image,

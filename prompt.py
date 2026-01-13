@@ -22,3 +22,26 @@ Output the data in the following JSON format:
     }
 If the field is not clear to you, leave it as NULL.
 """
+
+
+PROMPT[
+    "score"
+] = """
+Evaluate the quality and confidence of the data extraction from this image.
+
+Consider the following factors:
+- Text clarity and readability (blurriness, contrast, resolution)
+- Completeness of data (all expected fields are present and extractable)
+- Numerical accuracy (numbers are clear and unambiguous)
+- Image quality (lighting, distortion, occlusion)
+- Field alignment and structure consistency
+
+Provide a confidence score between 0 and 1:
+- 0.9-1.0: Excellent - All text is crystal clear, all fields are complete, no ambiguity
+- 0.7-0.9: Good - Text is readable, most fields are clear with minor uncertainties
+- 0.5-0.7: Fair - Some text is unclear or missing, requires manual verification
+- 0.3-0.5: Poor - Significant portions unclear or missing, high uncertainty
+- 0.0-0.3: Very Poor - Most data is unreadable or missing
+
+Return only a single number (e.g., 0.85) without explanation.
+"""
