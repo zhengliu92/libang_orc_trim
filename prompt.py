@@ -7,7 +7,6 @@ Please extract all text from this image. Return only the extracted text without 
 
 Fields example:
     "id": str, example: "Sample 001" or "MSZ 001 001",
-    "type": str, example: "absolute" or "relative", Note: # indicate the type is absolute, #Δ indicate the type is relative,
     "deg": List[int], always return [15, 25, 45, 75, 110],
     "L": List[float], example: [86.55, 64.55, 33.08, 15.71, 9.88], NOTE: value can be negative.
     "a": List[float], example: [7.03, 10.02, 12.01, 13.00, 13.99], NOTE: value can be negative.
@@ -16,7 +15,6 @@ Fields example:
 Output the data in the following JSON format:
     {
         "id": "Sample 000",
-        "type": "absolute",
         "deg": [15, 25, 45, 75, 110],
         "L": [86.55, 64.55, 33.08, 15.71, 9.88],
         "a": [7.03, 10.02, 12.01, 13.00, 13.99],

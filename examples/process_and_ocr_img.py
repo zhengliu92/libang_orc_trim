@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import logging
+import statistics
 import sys
 from pathlib import Path
 from typing import Optional
@@ -23,12 +24,12 @@ logger = logging.getLogger(__name__)
 # Configuration constants
 DEFAULT_BASE_URL = "http://192.168.1.100:1234/v1"
 MODELS = [
-    "google/gemma-3-12b",
     "qwen/qwen3-vl-8b",
     "qwen/qwen3-vl-8b:2",
+    "google/gemma-3-12b",
     "google/gemma-3-12b:2",
 ]
-DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = 1024
 DEFAULT_TIMEOUT = 120
 DEFAULT_CROP_MARGIN = 0.10
 OUTPUT_DIR = Path("output")
@@ -122,6 +123,10 @@ def ocr_image(
             }
         ],
         "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "top_k": 1,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
     }
 
     try:
@@ -160,7 +165,6 @@ def flatten_ocr_result(data: dict) -> dict:
         data: OCR result dictionary with structure:
             {
                 "id": str,
-                "type": str,
                 "deg": List[int],
                 "L": List[float],
                 "a": List[float],
@@ -174,7 +178,7 @@ def flatten_ocr_result(data: dict) -> dict:
         return {}
 
     # Validate required fields
-    required_fields = ["id", "type", "deg"]
+    required_fields = ["id", "deg"]
     for field in required_fields:
         if field not in data:
             logger.warning(f"Missing required field '{field}' in OCR result")
@@ -182,7 +186,6 @@ def flatten_ocr_result(data: dict) -> dict:
 
     result = {
         "id": data.get("id", ""),
-        "type": data.get("type", ""),
     }
 
     degrees = data.get("deg", [])
@@ -191,8 +194,8 @@ def flatten_ocr_result(data: dict) -> dict:
         return result
 
     # Process measurement values (L, a, b, etc.)
-    measurement_keys = [key for key in data.keys() if key not in ["id", "type", "deg"]]
-
+    measurement_keys = [key for key in data.keys() if key not in ["id", "deg"]]
+    numbers = []
     for key in measurement_keys:
         values = data[key]
         if not isinstance(values, list):
@@ -206,8 +209,14 @@ def flatten_ocr_result(data: dict) -> dict:
             continue
 
         for degree, value in zip(degrees, values):
+            numbers.append(abs(value))
             result[f"{degree}°{key}*"] = value
 
+    max_number = max(numbers)
+    if max_number < 10:
+        result["type"] = "relative"
+    else:
+        result["type"] = "absolute"
     return result
 
 
@@ -250,7 +259,7 @@ def validate_ocr_result(ocr_result: dict) -> tuple[str, bool]:
     measurement_keys = [
         key
         for key in ocr_result.keys()
-        if key not in ["id", "type", "file_name", "success", "comments", "has_mismatch"]
+        if key not in ["id", "file_name", "success", "comments", "has_mismatch"]
     ]
 
     if not measurement_keys:
@@ -417,6 +426,7 @@ def handle_image(
     logger.info(f"Processing: {file.name} with model: {model}")
 
     file_identifier = generate_file_identifier(file)
+
     result_data = {"file_name": file_identifier, "success": False, "model": model}
 
     try:
@@ -473,9 +483,7 @@ def main(model: str) -> None:
     pipeline = GroundingDINOBase()
     logger.info(f"Starting processing with model: {model}")
 
-    for file, image in image_loader(
-        "data/色差仪/爱色丽MA5QC色差仪/上汽江宁工厂-爱色丽MA-5-QC-相对值"
-    ):
+    for file, image in image_loader("data/色差仪/爱色丽MA5QC色差仪"):
         handle_image(pipeline, file, image, model=model)
 
     logger.info(f"Completed processing with model: {model}")

@@ -413,6 +413,8 @@ def image_loader(
 
     extensions = ("*.png", "*.jpg", "*.jpeg")
     image_files = [f for ext in extensions for f in path.rglob(ext)]
+    total_images = len(image_files)
+    logger.info(f"Loading {total_images} images from {path}")
 
     if not image_files:
         raise ValueError(f"No images found in {path}")
