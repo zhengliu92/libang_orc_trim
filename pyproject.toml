@@ -1,5 +1,5 @@
 [project]
-name = "screen-loc"
+name = "ocr_trim"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
