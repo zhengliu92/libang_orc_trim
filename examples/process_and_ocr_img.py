@@ -15,17 +15,27 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dino_base import GroundingDINOBase, image_loader
 from prompt import PROMPT
 from utils import with_logging
+from examples.load_train_data import load_train_data, get_by_id
 
 logger = logging.getLogger(__name__)
 
+
 # Configuration constants
 DEFAULT_BASE_URL = "http://192.168.1.100:1234/v1"
-DEFAULT_MODEL = "qwen/qwen3-vl-8b:2"
+MODELS = [
+    "google/gemma-3-12b",
+    "qwen/qwen3-vl-8b",
+    "qwen/qwen3-vl-8b:2",
+    "google/gemma-3-12b:2",
+]
 DEFAULT_MAX_TOKENS = 4096
-DEFAULT_TIMEOUT = 60
+DEFAULT_TIMEOUT = 120
 DEFAULT_CROP_MARGIN = 0.10
 OUTPUT_DIR = Path("output")
 OUTPUT_CSV = OUTPUT_DIR / "ocr_results.csv"
+TRAIN_DATA = load_train_data(
+    "data/色差仪/爱色丽MA5QC色差仪/上汽江宁工厂-爱色丽MA-5-QC.xlsx"
+)
 
 
 def encode_image_to_base64(image: Image.Image) -> str:
@@ -72,8 +82,8 @@ def parse_ocr_response(response_text: str) -> dict:
 def ocr_image(
     image: Image.Image,
     prompt: str,
+    model: str,
     base_url: str = DEFAULT_BASE_URL,
-    model: str = DEFAULT_MODEL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Optional[dict]:
@@ -201,6 +211,98 @@ def flatten_ocr_result(data: dict) -> dict:
     return result
 
 
+def validate_ocr_result(ocr_result: dict) -> tuple[str, bool]:
+    """
+    Validate OCR results against training data ground truth.
+
+    Args:
+        ocr_result: Dictionary containing OCR extracted data with flattened structure
+                   (e.g., {"id": "...", "type": "...", "15°L*": ..., "25°L*": ...})
+
+    Returns:
+        Tuple of (comments_string, has_mismatch):
+            - comments_string: Comma-separated list of mismatches, empty if no issues
+            - has_mismatch: Boolean indicating if validation failed
+    """
+    # Validate input has required fields
+    if not ocr_result:
+        logger.warning("Empty OCR result provided for validation")
+        return "Empty OCR result", True
+
+    if "id" not in ocr_result:
+        logger.warning("OCR result missing 'id' field")
+        return "Missing 'id' field in OCR result", True
+
+    # Get training data for comparison
+    try:
+        train_data = get_by_id(TRAIN_DATA, ocr_result["id"])
+    except Exception as e:
+        logger.error(
+            f"Error retrieving training data for id '{ocr_result.get('id')}': {e}"
+        )
+        return f"Failed to retrieve training data: {e}", True
+
+    if train_data is None:
+        logger.warning(f"No training data found for id: {ocr_result['id']}")
+        return f"No training data found for id: {ocr_result['id']}", True
+
+    # Extract measurement keys (exclude metadata fields)
+    measurement_keys = [
+        key
+        for key in ocr_result.keys()
+        if key not in ["id", "type", "file_name", "success", "comments", "has_mismatch"]
+    ]
+
+    if not measurement_keys:
+        logger.warning("No measurement keys found in OCR result")
+        return "No measurement data to validate", True
+
+    # Compare each measurement with training data
+    comments = []
+    for key in measurement_keys:
+        ocr_value = ocr_result[key]
+
+        # Convert key to lowercase for train_data lookup (e.g., "15°L*" -> "15°l*")
+        train_key = key.lower()
+
+        # Check if key exists in training data
+        if train_key not in train_data:
+            logger.warning(f"Key '{train_key}' not found in training data")
+            comments.append(f"{key}: Not found in training data")
+            continue
+
+        target_value = train_data[train_key]
+
+        # Handle None/NaN values
+        if pd.isna(ocr_value) and pd.isna(target_value):
+            continue  # Both are NaN, consider them equal
+
+        if pd.isna(ocr_value):
+            comments.append(f"{key}: OCR returned NULL, expected {target_value}")
+            continue
+
+        if pd.isna(target_value):
+            comments.append(f"{key}: Expected NULL, got {ocr_value}")
+            continue
+
+        # Compare values as strings (normalized)
+        ocr_str = str(ocr_value).strip()
+        target_str = str(target_value).strip()
+
+        if ocr_str != target_str:
+            comments.append(f"{key}: OCR={ocr_str} ≠ Target={target_str}")
+
+    comments_str = ", ".join(comments)
+    has_mismatch = len(comments) > 0
+
+    if has_mismatch:
+        logger.warning(f"Validation failed for id '{ocr_result['id']}': {comments_str}")
+    else:
+        logger.info(f"Validation passed for id '{ocr_result['id']}'")
+
+    return comments_str, has_mismatch
+
+
 def generate_file_identifier(file: Path) -> str:
     """
     Generate a unique identifier for a file based on its parent path and name.
@@ -250,6 +352,7 @@ def process_detected_image(
     image: Image.Image,
     file_identifier: str,
     device_prompt: str,
+    model: str,
     crop_margin: float = DEFAULT_CROP_MARGIN,
 ) -> Optional[dict]:
     """
@@ -261,6 +364,7 @@ def process_detected_image(
         file_identifier: Unique identifier for the file.
         device_prompt: Prompt for OCR specific to the device type.
         crop_margin: Margin for cropping (default: 0.10).
+        model: Model name to use for OCR (default: DEFAULT_MODEL).
 
     Returns:
         Dictionary containing OCR results, or None if processing fails.
@@ -279,8 +383,8 @@ def process_detected_image(
         # Continue with OCR even if save fails
 
     # Perform OCR
-    logger.info(f"Running OCR on cropped image: {file_identifier}")
-    ocr_result = ocr_image(cropped, prompt=device_prompt)
+    logger.info(f"Running OCR on cropped image: {file_identifier} with model: {model}")
+    ocr_result = ocr_image(cropped, prompt=device_prompt, model=model)
 
     if not ocr_result:
         logger.warning("OCR returned no results")
@@ -295,7 +399,12 @@ def process_detected_image(
     return flattened_result
 
 
-def handle_image(pipeline: GroundingDINOBase, file: Path, image: Image.Image) -> None:
+def handle_image(
+    pipeline: GroundingDINOBase,
+    file: Path,
+    image: Image.Image,
+    model: str,
+) -> None:
     """
     Process a single image: detect, crop, OCR, and save results.
 
@@ -303,11 +412,12 @@ def handle_image(pipeline: GroundingDINOBase, file: Path, image: Image.Image) ->
         pipeline: GroundingDINOBase instance for image processing.
         file: Path to the image file.
         image: PIL Image object.
+        model: Model name to use for OCR (default: DEFAULT_MODEL).
     """
-    logger.info(f"Processing: {file.name}")
+    logger.info(f"Processing: {file.name} with model: {model}")
 
     file_identifier = generate_file_identifier(file)
-    result_data = {"file_name": file_identifier, "success": False}
+    result_data = {"file_name": file_identifier, "success": False, "model": model}
 
     try:
         # Detect objects in the image
@@ -323,6 +433,7 @@ def handle_image(pipeline: GroundingDINOBase, file: Path, image: Image.Image) ->
             image=image,
             file_identifier=file_identifier,
             device_prompt=PROMPT["爱色丽MA5QC色差仪"],
+            model=model,
         )
 
         if not ocr_data:
@@ -333,28 +444,55 @@ def handle_image(pipeline: GroundingDINOBase, file: Path, image: Image.Image) ->
         # Update result with OCR data
         result_data.update(ocr_data)
         result_data["success"] = True
+
+        # Validate OCR results against training data
+        comments, has_mismatch = validate_ocr_result(ocr_data)
+        result_data["comments"] = comments
+        result_data["has_mismatch"] = has_mismatch
+
         append_to_csv(result_data, OUTPUT_CSV)
-        logger.info(f"Successfully processed: {file.name}")
+
+        if has_mismatch:
+            logger.warning(f"Processed {file.name} with validation mismatches")
+        else:
+            logger.info(f"Successfully processed: {file.name}")
 
     except Exception as e:
         logger.error(f"Error processing image {file.name}: {e}", exc_info=True)
         append_to_csv(result_data, OUTPUT_CSV)
 
 
-def main() -> None:
-    """Process all images in the 'images' directory."""
+def main(model: str) -> None:
+    """
+    Process all images in the 'images' directory with specified model.
+
+    Args:
+        model: Model name to use for OCR (default: DEFAULT_MODEL).
+    """
+
+    pipeline = GroundingDINOBase()
+    logger.info(f"Starting processing with model: {model}")
+
+    for file, image in image_loader(
+        "data/色差仪/爱色丽MA5QC色差仪/上汽江宁工厂-爱色丽MA-5-QC-相对值"
+    ):
+        handle_image(pipeline, file, image, model=model)
+
+    logger.info(f"Completed processing with model: {model}")
+
+
+if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    pipeline = GroundingDINOBase()
+    logger.info(f"Starting batch processing with {len(MODELS)} models: {MODELS}")
 
-    for file, image in image_loader(
-        "data/色差仪/爱色丽MA5QC色差仪/上汽江宁工厂-爱色丽MA-5-QC-相对值"
-    ):
-        handle_image(pipeline, file, image)
+    for model in MODELS:
+        logger.info(f"=" * 80)
+        logger.info(f"Processing with model: {model}")
+        logger.info(f"=" * 80)
+        main(model)
 
-
-if __name__ == "__main__":
-    main()
+    logger.info("Batch processing completed for all models")
