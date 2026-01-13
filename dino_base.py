@@ -10,6 +10,8 @@ from PIL import Image
 
 import logging
 
+from utils import with_logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -181,6 +183,7 @@ class GroundingDINOBase:
 
         return self._detection
 
+    @with_logging
     def process_image(
         self,
         image: Image.Image,
@@ -218,7 +221,10 @@ class GroundingDINOBase:
         image_size = image.width * image.height
         return self._filter_detections(detections, image_size)
 
-    def crop_image(self, image: Image.Image) -> Optional[Image.Image]:
+    @with_logging
+    def crop_image(
+        self, image: Image.Image, padding: float = None
+    ) -> Optional[Image.Image]:
         """
         Crop the detected region from the image.
 
@@ -240,6 +246,14 @@ class GroundingDINOBase:
         x1 = max(x0 + 1, min(x1, image.width))
         y1 = max(y0 + 1, min(y1, image.height))
 
+        crop_image_size = ((x1 - x0), (y1 - y0))
+        if padding:
+            padding_x = crop_image_size[0] * padding
+            padding_y = crop_image_size[1] * padding
+            x0 -= padding_x
+            x1 += padding_x
+            y0 -= padding_y
+            y1 += padding_y
         return image.crop((x0, y0, x1, y1))
 
     def save_image(self, image: Image.Image, file_name: str) -> str:
@@ -397,16 +411,12 @@ def image_loader(
     if not path.is_dir():
         raise ValueError(f"Provided path is not a directory: {path}")
 
-    supported_formats = {".png", ".jpg", ".jpeg"}
-    image_files = sorted(
-        f
-        for f in path.iterdir()
-        if f.is_file() and f.suffix.lower() in supported_formats
-    )
+    extensions = ("*.png", "*.jpg", "*.jpeg")
+    image_files = [f for ext in extensions for f in path.rglob(ext)]
 
     if not image_files:
-        raise ValueError(f"No PNG/JPG images found in {path}")
+        raise ValueError(f"No images found in {path}")
 
-    for file in image_files:
+    for file in sorted(image_files):
         with Image.open(file) as img:
             yield file, img.convert("RGB")
