@@ -2,14 +2,15 @@ import base64
 import io
 import json
 import logging
-import statistics
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 import pandas as pd
+from openai import OpenAI
 from PIL import Image
+from pydantic import BaseModel, Field
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -17,17 +18,36 @@ from dino_base import GroundingDINOBase, image_loader
 from prompt import PROMPT
 from utils import with_logging
 from examples.load_train_data import load_train_data, get_by_id
+from structured_logprobs import add_logprobs
 
 logger = logging.getLogger(__name__)
 
 
+# Pydantic models for structured outputs
+class OCRResponse(BaseModel):
+    """Pydantic model for OCR response structure."""
+
+    id: Optional[str] = Field(
+        None, description="Sample identifier (e.g., 'Sample 001' or 'MSZ 001 001')"
+    )
+    deg: Optional[List[int]] = Field(
+        None, description="Degree measurements, typically [15, 25, 45, 75, 110]"
+    )
+    L: Optional[List[float]] = Field(
+        None, description="L* color values (can be negative)"
+    )
+    a: Optional[List[float]] = Field(
+        None, description="a* color values (can be negative)"
+    )
+    b: Optional[List[float]] = Field(
+        None, description="b* color values (can be negative)"
+    )
+
+
 # Configuration constants
-DEFAULT_BASE_URL = "http://192.168.1.100:1234/v1"
+DEFAULT_BASE_URL = "http://192.168.1.100:8081/v1"
 MODELS = [
     "qwen/qwen3-vl-8b",
-    "qwen/qwen3-vl-8b:2",
-    "google/gemma-3-12b",
-    "google/gemma-3-12b:2",
 ]
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_TIMEOUT = 120
@@ -54,115 +74,6 @@ def encode_image_to_base64(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def parse_ocr_response(response_text: str) -> dict:
-    """
-    Parse OCR response text that may contain JSON wrapped in markdown code blocks.
-
-    Args:
-        response_text: Raw response text from OCR API.
-
-    Returns:
-        Parsed JSON dictionary.
-
-    Raises:
-        json.JSONDecodeError: If response cannot be parsed as JSON.
-    """
-    # Strip markdown code blocks if present
-    cleaned_text = response_text.strip()
-    if cleaned_text.startswith("```json"):
-        cleaned_text = cleaned_text[7:]
-    if cleaned_text.startswith("```"):
-        cleaned_text = cleaned_text[3:]
-    if cleaned_text.endswith("```"):
-        cleaned_text = cleaned_text[:-3]
-
-    return json.loads(cleaned_text.strip())
-
-
-@with_logging
-def check_confidence(
-    image: Image.Image,
-    model: str,
-    base_url: str = DEFAULT_BASE_URL,
-    max_tokens: int = 256,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> Optional[float]:
-    """
-    Evaluate the confidence score for data extraction from an image.
-
-    Args:
-        image: PIL Image to evaluate.
-        model: Model name to use for confidence evaluation.
-        base_url: Base URL for the OpenAI-compatible API.
-        max_tokens: Maximum tokens in response (default: 256 for score).
-        timeout: Request timeout in seconds.
-
-    Returns:
-        Confidence score as float between 0 and 1, or None if evaluation fails.
-    """
-    try:
-        image_base64 = encode_image_to_base64(image)
-    except Exception as e:
-        logger.error(f"Failed to encode image to base64 for confidence check: {e}")
-        return None
-
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": PROMPT["score"]},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_base64}"},
-                    },
-                ],
-            }
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "top_k": 1,
-        "frequency_penalty": 0.0,
-        "presence_penalty": 0.0,
-    }
-
-    try:
-        with httpx.Client(trust_env=False, timeout=timeout) as client:
-            response = client.post(
-                f"{base_url}/chat/completions",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-
-        result = response.json()
-        result_text = result["choices"][0]["message"]["content"].strip()
-
-        # Parse confidence score from response
-        confidence = float(result_text)
-
-        # Validate score is in range [0, 1]
-        if not 0.0 <= confidence <= 1.0:
-            logger.warning(f"Confidence score {confidence} out of range [0, 1]")
-            return None
-
-        return confidence
-
-    except httpx.HTTPError as e:
-        logger.error(f"HTTP error during confidence check: {e}")
-        return None
-    except (KeyError, IndexError) as e:
-        logger.error(f"Unexpected API response format during confidence check: {e}")
-        return None
-    except ValueError as e:
-        logger.error(f"Failed to parse confidence score as float: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error during confidence check: {e}")
-        return None
-
-
 @with_logging
 def ocr_image(
     image: Image.Image,
@@ -173,7 +84,7 @@ def ocr_image(
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Optional[dict]:
     """
-    Perform OCR on an image using an OpenAI-compatible vision API.
+    Perform OCR on an image using an OpenAI-compatible vision API with structured outputs.
 
     Args:
         image: PIL Image to perform OCR on.
@@ -186,59 +97,85 @@ def ocr_image(
     Returns:
         Extracted data as dictionary, or None if OCR fails.
     """
+    # Encode image to base64
     try:
         image_base64 = encode_image_to_base64(image)
     except Exception as e:
         logger.error(f"Failed to encode image to base64: {e}")
         return None
 
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_base64}"},
-                    },
-                ],
-            }
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "top_k": 1,
-        "frequency_penalty": 0.0,
-        "presence_penalty": 0.0,
-    }
+    # Initialize OpenAI client with custom httpx client
+    # Create httpx client that ignores system proxy settings
+    http_client = httpx.Client(
+        trust_env=False,
+        timeout=timeout,
+    )
 
     try:
-        # Use httpx with trust_env=False to ignore system proxy settings
-        with httpx.Client(trust_env=False, timeout=timeout) as client:
-            response = client.post(
-                f"{base_url}/chat/completions",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
+        client = OpenAI(
+            base_url=base_url,
+            api_key="dummy",  # Required but not used for local models
+            http_client=http_client,
+        )
 
-        result = response.json()
-        result_text = result["choices"][0]["message"]["content"]
-        return parse_ocr_response(result_text)
+        # Create chat completion with structured outputs
+        completion = client.beta.chat.completions.parse(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_base64}"
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=max_tokens,
+            temperature=0.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            logprobs=True,
+            top_logprobs=1,
+            response_format=OCRResponse,
+        )
 
-    except httpx.HTTPError as e:
-        logger.error(f"HTTP error during OCR request: {e}")
-        return None
-    except (KeyError, IndexError) as e:
-        logger.error(f"Unexpected API response format: {e}")
-        return None
+        # Add logprobs information
+        completion_with_logprobs = add_logprobs(completion)
+
+        # Log logprobs for debugging
+        if not completion_with_logprobs or not hasattr(
+            completion_with_logprobs, "log_probs"
+        ):
+            logger.error("No logprobs available")
+            return None
+
+        # Parse response content
+        content = completion.choices[0].message.content
+        if not content:
+            logger.error("Empty response content")
+            return None
+
+        # Parse JSON and validate with Pydantic
+        ocr_data = json.loads(content)
+        validated_response = OCRResponse.model_validate(ocr_data)
+
+        # Convert to dict for downstream processing
+        return validated_response.model_dump(exclude_none=False)
+
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse OCR response as JSON: {e}")
         return None
     except Exception as e:
-        logger.error(f"Unexpected error during OCR: {e}")
+        logger.error(f"Unexpected error during OCR: {e}", exc_info=True)
         return None
+    finally:
+        # Ensure httpx client is closed
+        http_client.close()
 
 
 def flatten_ocr_result(data: dict) -> dict:
@@ -447,10 +384,9 @@ def process_detected_image(
     device_prompt: str,
     model: str,
     crop_margin: float = DEFAULT_CROP_MARGIN,
-    confidence_threshold: float = 0.3,
 ) -> Optional[dict]:
     """
-    Process a detected image: crop, save, check confidence, and perform OCR.
+    Process a detected image: crop, save, and perform OCR.
 
     Args:
         pipeline: GroundingDINOBase instance for image processing.
@@ -459,10 +395,9 @@ def process_detected_image(
         device_prompt: Prompt for OCR specific to the device type.
         model: Model name to use for OCR.
         crop_margin: Margin for cropping (default: 0.10).
-        confidence_threshold: Minimum confidence score to proceed with OCR (default: 0.3).
 
     Returns:
-        Dictionary containing OCR results and confidence score, or None if processing fails.
+        Dictionary containing OCR results, or None if processing fails.
     """
     # Crop the image
     cropped = pipeline.crop_image(image, crop_margin)
@@ -475,22 +410,6 @@ def process_detected_image(
         pipeline.save_image(cropped, file_identifier)
     except Exception as e:
         logger.error(f"Failed to save cropped image: {e}")
-        # Continue with confidence check even if save fails
-
-    # Check confidence before OCR
-    logger.info(f"Checking confidence for: {file_identifier} with model: {model}")
-    confidence = check_confidence(cropped, model=model)
-
-    if confidence is None:
-        logger.warning(f"Failed to get confidence score for {file_identifier}")
-        # Continue with OCR anyway if confidence check fails
-    elif confidence < confidence_threshold:
-        logger.warning(
-            f"Low confidence score ({confidence:.2f}) for {file_identifier}, "
-            f"below threshold {confidence_threshold}. Proceeding with OCR anyway."
-        )
-    else:
-        logger.info(f"Confidence score: {confidence:.2f} for {file_identifier}")
 
     # Perform OCR
     logger.info(f"Running OCR on cropped image: {file_identifier} with model: {model}")
@@ -505,9 +424,6 @@ def process_detected_image(
     if not flattened_result:
         logger.warning("Failed to flatten OCR result")
         return None
-
-    # Add confidence score to result
-    flattened_result["confidence"] = confidence
 
     return flattened_result
 
@@ -541,7 +457,7 @@ def handle_image(
             append_to_csv(result_data, OUTPUT_CSV)
             return
 
-        # Process detected image (crop + confidence check + OCR)
+        # Process detected image (crop +  OCR)
         ocr_data = process_detected_image(
             pipeline=pipeline,
             image=image,

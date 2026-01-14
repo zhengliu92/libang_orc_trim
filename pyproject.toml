@@ -14,6 +14,7 @@ dependencies = [
     "pandas>=2.3.3",
     "pillow>=12.0.0",
     "requests>=2.32.5",
+    "structured-logprobs>=0.1.5",
     "torch>=2.9.0",
     "torchaudio>=2.9.0",
     "torchvision>=0.24.0",
