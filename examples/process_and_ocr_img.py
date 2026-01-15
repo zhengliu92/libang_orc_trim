@@ -2,9 +2,10 @@ import base64
 import io
 import json
 import logging
+import math
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import httpx
 import pandas as pd
@@ -30,28 +31,26 @@ class OCRResponse(BaseModel):
     id: Optional[str] = Field(
         None, description="Sample identifier (e.g., 'Sample 001' or 'MSZ 001 001')"
     )
-    deg: Optional[List[int]] = Field(
+    deg: Optional[list[int]] = Field(
         None, description="Degree measurements, typically [15, 25, 45, 75, 110]"
     )
-    L: Optional[List[float]] = Field(
-        None, description="L* color values (can be negative)"
+    L: Optional[list[float]] = Field(
+        None, description="L* color values (LAB color space, can be negative)"
     )
-    a: Optional[List[float]] = Field(
-        None, description="a* color values (can be negative)"
+    a: Optional[list[float]] = Field(
+        None, description="a* color values (LAB color space, can be negative)"
     )
-    b: Optional[List[float]] = Field(
-        None, description="b* color values (can be negative)"
+    b: Optional[list[float]] = Field(
+        None, description="b* color values (LAB color space, can be negative)"
     )
 
 
 # Configuration constants
 DEFAULT_BASE_URL = "http://192.168.1.100:8081/v1"
-MODELS = [
-    "qwen/qwen3-vl-8b",
-]
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_TIMEOUT = 120
 DEFAULT_CROP_MARGIN = 0.10
+RELATIVE_ABSOLUTE_THRESHOLD = 10  # Values below 10 are considered relative measurements
 OUTPUT_DIR = Path("output")
 OUTPUT_CSV = OUTPUT_DIR / "ocr_results.csv"
 TRAIN_DATA = load_train_data(
@@ -82,7 +81,7 @@ def ocr_image(
     base_url: str = DEFAULT_BASE_URL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = DEFAULT_TIMEOUT,
-) -> Optional[dict]:
+) -> Optional[tuple[dict, dict]]:
     """
     Perform OCR on an image using an OpenAI-compatible vision API with structured outputs.
 
@@ -95,8 +94,24 @@ def ocr_image(
         timeout: Request timeout in seconds.
 
     Returns:
-        Extracted data as dictionary, or None if OCR fails.
+        Tuple of (ocr_data, logprobs) where:
+            - ocr_data: Extracted data as dictionary
+            - logprobs: Log probabilities as dictionary
+        Returns None if OCR fails.
     """
+    # Validate inputs early
+    if not image:
+        logger.error("Image parameter is None or empty")
+        return None
+
+    if not prompt or not prompt.strip():
+        logger.error("Prompt parameter is empty")
+        return None
+
+    if not model or not model.strip():
+        logger.error("Model parameter is empty")
+        return None
+
     # Encode image to base64
     try:
         image_base64 = encode_image_to_base64(image)
@@ -119,6 +134,7 @@ def ocr_image(
         )
 
         # Create chat completion with structured outputs
+
         completion = client.beta.chat.completions.parse(
             model=model,
             messages=[
@@ -147,11 +163,13 @@ def ocr_image(
         # Add logprobs information
         completion_with_logprobs = add_logprobs(completion)
 
-        # Log logprobs for debugging
-        if not completion_with_logprobs or not hasattr(
-            completion_with_logprobs, "log_probs"
-        ):
-            logger.error("No logprobs available")
+        # Validate logprobs early
+        if not completion_with_logprobs:
+            logger.error("Failed to add logprobs to completion")
+            return None
+
+        if not hasattr(completion_with_logprobs, "log_probs"):
+            logger.error("No logprobs available in completion")
             return None
 
         # Parse response content
@@ -162,10 +180,8 @@ def ocr_image(
 
         # Parse JSON and validate with Pydantic
         ocr_data = json.loads(content)
-        validated_response = OCRResponse.model_validate(ocr_data)
-
-        # Convert to dict for downstream processing
-        return validated_response.model_dump(exclude_none=False)
+        logprobs = completion_with_logprobs.log_probs[0]
+        return ocr_data, logprobs
 
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse OCR response as JSON: {e}")
@@ -178,7 +194,9 @@ def ocr_image(
         http_client.close()
 
 
-def flatten_ocr_result(data: dict) -> dict:
+def flatten_ocr_result(
+    data: dict, logprobs: Optional[dict] = None
+) -> tuple[dict, dict]:
     """
     Flatten OCR result by expanding degree-based measurements into separate columns.
 
@@ -186,24 +204,29 @@ def flatten_ocr_result(data: dict) -> dict:
         data: OCR result dictionary with structure:
             {
                 "id": str,
-                "deg": List[int],
-                "L": List[float],
-                "a": List[float],
-                "b": List[float]
+                "deg": list[int],
+                "L": list[float],
+                "a": list[float],
+                "b": list[float]
             }
+        logprobs: Optional logprobs dictionary with structure mirroring data.
+                  If provided, logprobs will be converted to probabilities and merged into result.
 
     Returns:
-        Flattened dictionary with columns like "15°L*", "25°L*", etc.
+        Tuple of (flattened_result, flattened_probs):
+            - flattened_result: Dictionary with columns like "15°L*", "25°L*", etc.
+            - flattened_probs: Dictionary with probability columns like "15°L*_prob", "25°L*_prob", etc.
     """
+    # Validate required fields early
     if not data:
-        return {}
+        logger.warning("Empty data dictionary provided")
+        return {}, {}
 
-    # Validate required fields
     required_fields = ["id", "deg"]
     for field in required_fields:
         if field not in data:
             logger.warning(f"Missing required field '{field}' in OCR result")
-            return {}
+            return {}, {}
 
     result = {
         "id": data.get("id", ""),
@@ -212,7 +235,7 @@ def flatten_ocr_result(data: dict) -> dict:
     degrees = data.get("deg", [])
     if not degrees:
         logger.warning("No degree values found in OCR result")
-        return result
+        return result, {}
 
     # Process measurement values (L, a, b, etc.)
     measurement_keys = [key for key in data.keys() if key not in ["id", "deg"]]
@@ -233,11 +256,84 @@ def flatten_ocr_result(data: dict) -> dict:
             numbers.append(abs(value))
             result[f"{degree}°{key}*"] = value
 
-    max_number = max(numbers)
-    if max_number < 10:
-        result["type"] = "relative"
-    else:
-        result["type"] = "absolute"
+    # Determine type based on values
+    if numbers:
+        max_number = max(numbers)
+        if max_number < RELATIVE_ABSOLUTE_THRESHOLD:
+            result["type"] = "relative"
+        else:
+            result["type"] = "absolute"
+
+    # Flatten and merge logprobs if provided
+    flattened_probs = {}
+    if logprobs:
+        flattened_probs = flatten_logprobs(logprobs, degrees)
+
+    return result, flattened_probs
+
+
+def flatten_logprobs(logprobs: dict, degrees: list[int]) -> dict:
+    """
+    Flatten logprobs by converting to probabilities and expanding into separate columns.
+
+    Args:
+        logprobs: Logprobs dictionary with structure mirroring OCR response:
+            {
+                "id": float (log probability),
+                "deg": List[float] (log probabilities),
+                "L": List[float] (log probabilities),
+                "a": List[float] (log probabilities),
+                "b": List[float] (log probabilities)
+            }
+        degrees: List of degree values (e.g., [15, 25, 45, 75, 110])
+
+    Returns:
+        Flattened dictionary with probability columns like "15°L*_prob", "25°L*_prob", etc.
+        Log probabilities are converted to probabilities using math.exp().
+    """
+    if not logprobs or not degrees:
+        return {}
+
+    result = {}
+
+    # Add probability for id field if available
+    if "id" in logprobs and isinstance(logprobs["id"], (int, float)):
+        result["id_prob"] = math.exp(logprobs["id"])
+
+    # Add probability for deg field if available
+    if "deg" in logprobs and isinstance(logprobs["deg"], list):
+        deg_logprobs = logprobs["deg"]
+        # Calculate average logprob for degrees, then convert to probability
+        if deg_logprobs:
+            try:
+                avg_deg_logprob = sum(deg_logprobs) / len(deg_logprobs)
+                result["deg_prob"] = math.exp(avg_deg_logprob)
+            except (TypeError, ZeroDivisionError):
+                logger.warning("Failed to calculate average probability for degrees")
+
+    # Process measurement logprobs (L, a, b, etc.)
+    measurement_keys = [key for key in logprobs.keys() if key not in ["id", "deg"]]
+
+    for key in measurement_keys:
+        logprob_values = logprobs[key]
+
+        # Handle non-list values
+        if not isinstance(logprob_values, list):
+            logger.warning(f"Unexpected non-list logprob value for key '{key}'")
+            continue
+
+        # Check length match with degrees
+        if len(logprob_values) != len(degrees):
+            logger.warning(
+                f"Mismatch between degrees ({len(degrees)}) and logprob values ({len(logprob_values)}) for key '{key}'"
+            )
+            continue
+
+        # Create flattened columns like "15°L*_prob", "25°L*_prob"
+        # Convert log probabilities to probabilities
+        for degree, logprob_value in zip(degrees, logprob_values):
+            result[f"{degree}°{key}*_prob"] = math.exp(logprob_value)
+
     return result
 
 
@@ -277,11 +373,7 @@ def validate_ocr_result(ocr_result: dict) -> tuple[str, bool]:
         return f"No training data found for id: {ocr_result['id']}", True
 
     # Extract measurement keys (exclude metadata fields)
-    measurement_keys = [
-        key
-        for key in ocr_result.keys()
-        if key not in ["id", "file_name", "success", "comments", "has_mismatch"]
-    ]
+    measurement_keys = [key for key in ocr_result.keys() if key not in ["id"]]
 
     if not measurement_keys:
         logger.warning("No measurement keys found in OCR result")
@@ -290,6 +382,8 @@ def validate_ocr_result(ocr_result: dict) -> tuple[str, bool]:
     # Compare each measurement with training data
     comments = []
     for key in measurement_keys:
+        if key == "type":
+            continue
         ocr_value = ocr_result[key]
 
         # Convert key to lowercase for train_data lookup (e.g., "15°L*" -> "15°l*")
@@ -384,7 +478,7 @@ def process_detected_image(
     device_prompt: str,
     model: str,
     crop_margin: float = DEFAULT_CROP_MARGIN,
-) -> Optional[dict]:
+) -> Optional[tuple[dict, dict]]:
     """
     Process a detected image: crop, save, and perform OCR.
 
@@ -397,8 +491,17 @@ def process_detected_image(
         crop_margin: Margin for cropping (default: 0.10).
 
     Returns:
-        Dictionary containing OCR results, or None if processing fails.
+        Tuple of (flattened_result, flattened_probs) containing OCR results,
+        or None if processing fails.
     """
+    if not file_identifier or not file_identifier.strip():
+        logger.error("File identifier is empty")
+        return None
+
+    if not device_prompt or not device_prompt.strip():
+        logger.error("Device prompt is empty")
+        return None
+
     # Crop the image
     cropped = pipeline.crop_image(image, crop_margin)
     if not cropped:
@@ -413,19 +516,22 @@ def process_detected_image(
 
     # Perform OCR
     logger.info(f"Running OCR on cropped image: {file_identifier} with model: {model}")
-    ocr_result = ocr_image(cropped, prompt=device_prompt, model=model)
+    ocr_result_tuple = ocr_image(cropped, prompt=device_prompt, model=model)
 
-    if not ocr_result:
+    if not ocr_result_tuple:
         logger.warning("OCR returned no results")
         return None
 
+    ocr_result, logprobs = ocr_result_tuple
+
     # Flatten OCR result
-    flattened_result = flatten_ocr_result(ocr_result)
+    flattened_result, flattened_logprobs = flatten_ocr_result(ocr_result, logprobs)
+
     if not flattened_result:
         logger.warning("Failed to flatten OCR result")
         return None
 
-    return flattened_result
+    return flattened_result, flattened_logprobs
 
 
 def handle_image(
@@ -441,8 +547,25 @@ def handle_image(
         pipeline: GroundingDINOBase instance for image processing.
         file: Path to the image file.
         image: PIL Image object.
-        model: Model name to use for OCR (default: DEFAULT_MODEL).
+        model: Model name to use for OCR.
     """
+    # Validate inputs early
+    if not pipeline:
+        logger.error("Pipeline parameter is None")
+        return
+
+    if not file:
+        logger.error("File parameter is None")
+        return
+
+    if not image:
+        logger.error("Image parameter is None")
+        return
+
+    if not model or not model.strip():
+        logger.error("Model parameter is empty")
+        return
+
     logger.info(f"Processing: {file.name} with model: {model}")
 
     file_identifier = generate_file_identifier(file)
@@ -458,7 +581,7 @@ def handle_image(
             return
 
         # Process detected image (crop +  OCR)
-        ocr_data = process_detected_image(
+        processed_result = process_detected_image(
             pipeline=pipeline,
             image=image,
             file_identifier=file_identifier,
@@ -466,20 +589,21 @@ def handle_image(
             model=model,
         )
 
-        if not ocr_data:
+        if not processed_result:
             logger.warning(f"Failed to process detected image: {file.name}")
             append_to_csv(result_data, OUTPUT_CSV)
             return
 
+        ocr_data, probs = processed_result
+
         # Update result with OCR data
         result_data.update(ocr_data)
-        result_data["success"] = True
-
         # Validate OCR results against training data
         comments, has_mismatch = validate_ocr_result(ocr_data)
-        result_data["comments"] = comments
+        result_data.update(probs)
+        result_data["success"] = True
         result_data["has_mismatch"] = has_mismatch
-
+        result_data["comments"] = comments
         append_to_csv(result_data, OUTPUT_CSV)
 
         if has_mismatch:
@@ -497,8 +621,12 @@ def main(model: str) -> None:
     Process all images in the 'images' directory with specified model.
 
     Args:
-        model: Model name to use for OCR (default: DEFAULT_MODEL).
+        model: Model name to use for OCR.
     """
+    # Validate inputs early
+    if not model or not model.strip():
+        logger.error("Model parameter is empty")
+        return
 
     pipeline = GroundingDINOBase()
     logger.info(f"Starting processing with model: {model}")
@@ -514,13 +642,7 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-
-    logger.info(f"Starting batch processing with {len(MODELS)} models: {MODELS}")
-
-    for model in MODELS:
-        logger.info(f"=" * 80)
-        logger.info(f"Processing with model: {model}")
-        logger.info(f"=" * 80)
-        main(model)
-
-    logger.info("Batch processing completed for all models")
+    model = "gemma-3-12b-it-Q6_K"
+    logger.info(f"Starting processing with model: {model}")
+    main(model)
+    logger.info("Processing completed")
